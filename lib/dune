@@ -35,4 +35,23 @@
  (foreign_archives rsdd)
  (library_flags (-linkall))
  (name diceLib)
- (preprocess (pps ppx_jane)))
+ (preprocess (pps ppx_jane))
+ (modules Bdd BddUtil Compiler CoreGrammar ExternalGrammar lexer LogProbability Optimization Parser
+   Parser_messages Passes Util VarState Wmc))
+
+(executable
+ (name dice_bindings)
+ (libraries core diceLib)
+ (modules dice_bindings)
+ (preprocess
+  (pps ppx_jane))
+ (modes (native shared_object))
+ (link_flags (-cclib -L/usr/lib/x86_64-linux-gnu) (-linkall))
+ ; (link_flags (-cclib -L%{env:C_LIB_PATH=/}))
+ (foreign_stubs
+  (language c)
+  (names dice_stubs)))
+
+(rule
+ (action
+  (copy dice_bindings.so libdice_bindings.so)))
