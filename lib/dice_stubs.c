@@ -19,6 +19,7 @@
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 #include <stdio.h>
+#include <stdlib.h> 
 
 static int ocaml_initialized = 0;
 
@@ -231,4 +232,77 @@ int mk_func_c(const char *name, const char *args_csv, int body_id) {
   value v_res = caml_callback3(*v_cb, v_name, v_args, Val_int(body_id));
   int res = Int_val(v_res);
   CAMLreturnT(int, res);
+}
+
+int mk_func_call_c(const char *name, const char *args_csv) {
+  ocaml_runtime_init();
+  CAMLparam0();
+  CAMLlocal2(v_name, v_args);
+
+  v_name = caml_copy_string(name);
+  v_args = caml_copy_string(args_csv);
+  const value *v_cb = caml_named_value("mk_func_call");
+  if (v_cb == NULL)
+    caml_failwith("mk_func_call callback not found");
+  value v_res = caml_callback2(*v_cb, v_name, v_args);
+  int res = Int_val(v_res);
+  CAMLreturnT(int, res);
+}
+
+typedef struct {
+    double* ptr;
+    int len;
+} float_array_res;
+
+float_array_res* eval_distributions_c(int body_handle) {
+    ocaml_runtime_init();
+    CAMLparam0();
+    CAMLlocal2(v_body_handle, result_list);
+    CAMLlocal1(head);
+
+    v_body_handle = Val_int(body_handle);
+
+    const value* closure = caml_named_value("eval_distributions");
+    if (closure == NULL) {
+        caml_failwith("eval_distributions callback not found");
+    }
+
+    result_list = caml_callback(*closure, v_body_handle);
+
+    int list_len = 0;
+    head = result_list;
+    while (head != Val_emptylist) {
+        list_len++;
+        head = Field(head, 1);
+    }
+
+    double* arr = (double*)malloc(sizeof(double) * list_len);
+    if (arr == NULL) {
+      caml_failwith("Failed to allocate memory for double array in C stub");
+    }
+
+    head = result_list;
+    for (int i = 0; i < list_len; i++) {
+        arr[i] = Double_val(Field(head, 0));
+        head = Field(head, 1);
+    }
+
+    float_array_res* res = (float_array_res*)malloc(sizeof(float_array_res));
+    if (res == NULL) {
+      free(arr);
+      caml_failwith("Failed to allocate memory for result struct in C stub");
+    }
+    res->ptr = arr;
+    res->len = list_len;
+
+    CAMLreturnT(float_array_res*, res);
+}
+
+void free_distributions_c(float_array_res* res) {
+    if (res != NULL) {
+        if (res->ptr != NULL) {
+            free(res->ptr);
+        }
+        free(res);
+    }
 }

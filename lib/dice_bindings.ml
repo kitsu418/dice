@@ -6,6 +6,7 @@ module BD = DiceLib.Bdd
 module WM = DiceLib.Wmc
 module LP = DiceLib.LogProbability
 module BG = Bignum
+module BU = DiceLib.BddUtil
 
 (* Expression table: handle -> expr *)
 let expr_tbl : (int, CG.expr) Hashtbl.Poly.t = Hashtbl.Poly.create ()
@@ -43,6 +44,9 @@ let store_prog (p : Comp.compiled_program) : int =
 
 let get_prog id = Hashtbl.find_exn prog_tbl id
 
+(* Ident table: name -> expr_id *)
+let ident_tbl : (string, int) Hashtbl.Poly.t = Hashtbl.Poly.create ()
+
 (* helpers to parse CSV strings passed from FFI *)
 let parse_int_csv (s:string) : int list =
   let s = String.strip s in
@@ -56,7 +60,12 @@ let parse_str_csv (s:string) : string list =
 
 (* --- Constructors exposed to FFI --- *)
 let mk_ident (name:string) : int =
-  store_expr (CG.Ident name)
+  match Hashtbl.find ident_tbl name with
+  | Some id -> id
+  | None ->
+    let id = store_expr (CG.Ident name) in
+    Hashtbl.set ident_tbl ~key:name ~data:id;
+    id
 
 let mk_flip (p:float) : int =
   store_expr (CG.Flip (BG.of_float_decimal p))
@@ -99,6 +108,11 @@ let mk_func (name:string) (args_csv:string) (body_id:int) : int =
   let body = get_expr body_id in
   store_func { CG.name = name; CG.args = args; CG.body = body }
 
+let mk_func_call (name:string) (args_csv:string) : int =
+  let arg_ids = parse_int_csv args_csv in
+  let args = List.map arg_ids ~f:get_expr in
+  store_expr (CG.FuncCall (name, args))
+
 (* Build and compile program. func_ids_csv is a CSV of function handles (ints). *)
 (* Build and compile program from a list of function handles (int list) and a body id.
    This avoids passing CSV strings across the FFI. *)
@@ -135,11 +149,78 @@ let eval_bool_prog (prog_id:int) (fname:string) (arg_indices:int list) : float =
   in
   let final_z = BD.bdd_and cprog.ctx.man cprog.body.z final_z_local in
 
-  let denom = WM.wmc ~wmc_type:0 cprog.ctx.man cprog.body.z cprog.ctx.weights in
+  let denom = WM.wmc ~collect_cache:true ~wmc_type:0 cprog.ctx.man cprog.body.z cprog.ctx.weights in
+  let cache = WM.last_cache () in
   let leaf = VS.extract_leaf final_state in
-  let numer = WM.wmc ~wmc_type:0 cprog.ctx.man (BD.bdd_and cprog.ctx.man leaf final_z) cprog.ctx.weights in
+  let leaf_with_constraints = BD.bdd_and cprog.ctx.man leaf final_z in
+  let numer =
+    match cache with
+    | Some c ->
+      (match Hashtbl.Poly.find c leaf_with_constraints with
+       | Some v ->
+         printf "[dice] WMC cache hit (eval_bool_prog numerator)\n%!";
+         v
+       | None -> WM.wmc ~wmc_type:0 cprog.ctx.man leaf_with_constraints cprog.ctx.weights)
+    | None -> WM.wmc ~wmc_type:0 cprog.ctx.man leaf_with_constraints cprog.ctx.weights
+  in
   let res = LP.rat_div_and_conv numer denom in
   BG.to_float res
+
+let eval_distributions (body_handle:int) : float list =
+  let body_expr = get_expr body_handle in
+  let program = { CG.functions = []; CG.body = body_expr } in
+
+  Printf.printf "[dice] Compiling program for eval_distributions\n%!";
+  let compiled_prog = Comp.compile_program program ~eager_eval:false in
+  Printf.printf "[dice] Compiled program for eval_distributions\n%!";
+  
+  let man = compiled_prog.ctx.man in
+  let weights = compiled_prog.ctx.weights in
+  let z = compiled_prog.body.z in 
+  let prob_denominator = WM.wmc ~collect_cache:true ~wmc_type:0 man z weights in
+  let cache = WM.last_cache () in
+  let leaves = VS.collect_leaves compiled_prog.body.state in
+
+  List.map leaves ~f:(fun leaf_bdd ->
+    let leaf_with_constraints = BD.bdd_and man leaf_bdd z in
+    (* let leaf_with_constraints = leaf_bdd in *)
+    let prob_numerator =
+      match cache with
+      | Some c ->
+        (match Hashtbl.Poly.find c leaf_with_constraints with
+         | Some v ->
+           printf "[dice] WMC cache hit (eval_distributions numerator)\n%!";
+           v
+         | None -> WM.wmc ~wmc_type:0 man leaf_with_constraints weights)
+      | None -> WM.wmc ~wmc_type:0 man leaf_with_constraints weights
+    in
+    let p = LP.rat_div_and_conv prob_numerator prob_denominator in
+    Printf.printf "[dice] Distribution leaf WMC:probability=%f\n%!"
+      (BG.to_float p);
+    BG.to_float p
+  )
+
+let dump_compiled_bdds (compiled_prog: Comp.compiled_program) : unit =
+  let man = compiled_prog.ctx.man in
+  let name_map = compiled_prog.ctx.name_map in
+  let leaves = VS.collect_leaves compiled_prog.body.state in
+  List.iteri leaves ~f:(fun idx leaf_bdd ->
+    Format.printf "Leaf %d BDD:\n%!" idx;
+    BU.dump_dot man name_map leaf_bdd;
+    Format.printf "\n%!") ;
+  Format.printf "Constraint Z:\n%!";
+  BU.dump_dot man name_map compiled_prog.body.z;
+  Format.printf "\n%!"
+
+let dump_bdds_for_body (body_handle:int) : unit =
+  let body_expr = get_expr body_handle in
+  let program = { CG.functions = []; CG.body = body_expr } in
+  let compiled_prog = Comp.compile_program program ~eager_eval:false in
+  dump_compiled_bdds compiled_prog
+
+let dump_bdds_for_prog (prog_id:int) : unit =
+  let compiled_prog = get_prog prog_id in
+  dump_compiled_bdds compiled_prog
 
 (* Register for C callbacks *)
 let () =
@@ -153,5 +234,9 @@ let () =
   Callback.register "mk_snd" mk_snd;
   Callback.register "mk_let" mk_let;
   Callback.register "mk_func" mk_func;
+  Callback.register "mk_func_call" mk_func_call;
   Callback.register "build_and_compile_program" build_and_compile_program;
-  Callback.register "eval_bool_prog" eval_bool_prog
+  Callback.register "eval_bool_prog" eval_bool_prog;
+  Callback.register "eval_distributions" eval_distributions;
+  Callback.register "dump_bdds_for_body" dump_bdds_for_body;
+  Callback.register "dump_bdds_for_prog" dump_bdds_for_prog
